@@ -1,14 +1,12 @@
-import pyaudio
+import sounddevice as sd
 import numpy as np
-import threading
 import time
 from collections import deque
+import queue
 
 class AudioChannelRouter:
     def __init__(self):
-        self.p = pyaudio.PyAudio()
         self.CHUNK = 512
-        self.FORMAT = pyaudio.paInt16
         self.RATE = 48000
         self.INPUT_CHANNELS = 10
         self.OUTPUT_CHANNELS = 2
@@ -24,15 +22,8 @@ class AudioChannelRouter:
         # Audio level history for smoothing
         self.level_history = {i: deque(maxlen=5) for i in range(self.INPUT_CHANNELS)}
         
-        # Output routing (which input channel goes to which output channel)
-        self.output_routing = {
-            'left': None,   # Will be set to active channel
-            'right': None   # Can duplicate or use different channel
-        }
-        
         self.running = False
-        self.input_stream = None
-        self.output_stream = None
+        self.stream = None
         
     def db_from_amplitude(self, amplitude):
         """Convert amplitude to dB"""
@@ -44,8 +35,8 @@ class AudioChannelRouter:
         """Calculate RMS level for each channel"""
         levels = []
         for i in range(self.INPUT_CHANNELS):
-            channel_data = audio_data[i::self.INPUT_CHANNELS]
-            rms = np.sqrt(np.mean(channel_data.astype(np.float32)**2))
+            channel_data = audio_data[:, i]
+            rms = np.sqrt(np.mean(channel_data**2))
             db = self.db_from_amplitude(rms)
             
             # Add to history and get smoothed value
@@ -103,46 +94,53 @@ class AudioChannelRouter:
         self.active_channel = None
         return None
     
-    def process_audio(self, in_data, frame_count, time_info, status):
+    def audio_callback(self, indata, outdata, frames, time_info, status):
         """Audio callback function"""
-        # Convert bytes to numpy array
-        audio_data = np.frombuffer(in_data, dtype=np.int16)
+        if status:
+            print(f"Status: {status}")
         
         # Get levels for all channels
-        levels = self.get_channel_levels(audio_data)
+        levels = self.get_channel_levels(indata)
         
         # Select active channel
         active_ch = self.select_active_channel(levels)
         
-        # Create output audio (stereo)
-        output_data = np.zeros(frame_count * self.OUTPUT_CHANNELS, dtype=np.int16)
+        # Initialize output with silence
+        outdata.fill(0)
         
         if active_ch is not None:
-            # Extract active channel data
-            channel_data = audio_data[active_ch::self.INPUT_CHANNELS]
+            # Extract active channel data and route to both stereo channels
+            channel_data = indata[:, active_ch]
+            outdata[:, 0] = channel_data  # Left
+            outdata[:, 1] = channel_data  # Right
             
-            # Route to both left and right (stereo)
-            output_data[0::2] = channel_data  # Left
-            output_data[1::2] = channel_data  # Right
-            
-            # Print status
-            print(f"\rActive: Ch{active_ch + 1} ({levels[active_ch]:.1f} dB)  " + 
-                  " ".join([f"Ch{i+1}:{lvl:.0f}" for i, lvl in enumerate(levels)[:5]]), 
+            # Print status (limit output to first 5 channels for readability)
+            print(f"\rActive: Ch{active_ch + 1} ({levels[active_ch]:>5.1f} dB) | " + 
+                  " ".join([f"Ch{i+1}:{lvl:>4.0f}" for i, lvl in enumerate(levels)[:5]]), 
                   end="", flush=True)
         else:
-            print("\rNo active channel" + " " * 50, end="", flush=True)
-        
-        return (output_data.tobytes(), pyaudio.paContinue)
+            print("\r" + "No active channel" + " " * 60, end="", flush=True)
     
     def list_devices(self):
         """List all audio devices"""
-        print("\n=== Available Audio Devices ===")
-        for i in range(self.p.get_device_count()):
-            info = self.p.get_device_info_by_index(i)
-            print(f"\nDevice {i}: {info['name']}")
-            print(f"  Max Input Channels: {info['maxInputChannels']}")
-            print(f"  Max Output Channels: {info['maxOutputChannels']}")
-            print(f"  Default Sample Rate: {info['defaultSampleRate']}")
+        print("\n" + "="*70)
+        print("AVAILABLE AUDIO DEVICES")
+        print("="*70)
+        devices = sd.query_devices()
+        
+        for i, device in enumerate(devices):
+            print(f"\nDevice {i}: {device['name']}")
+            print(f"  Input Channels:  {device['max_input_channels']}")
+            print(f"  Output Channels: {device['max_output_channels']}")
+            print(f"  Default Sample Rate: {device['default_samplerate']} Hz")
+            
+            # Highlight devices that could work
+            if device['max_input_channels'] >= 10:
+                print(f"  ✓ Can be used as INPUT (has 10+ channels)")
+            if device['max_output_channels'] >= 2:
+                print(f"  ✓ Can be used as OUTPUT (has stereo)")
+        
+        print("\n" + "="*70)
     
     def start(self, input_device_idx, output_device_idx):
         """Start the audio router"""
@@ -151,80 +149,104 @@ class AudioChannelRouter:
             return
         
         try:
-            print(f"\nStarting Audio Router...")
-            print(f"Input Device: {input_device_idx}")
-            print(f"Output Device: {output_device_idx}")
-            print(f"Threshold: {self.threshold_db} dB")
+            print(f"\n{'='*70}")
+            print("STARTING AUDIO ROUTER")
+            print("="*70)
+            print(f"Input Device:  {input_device_idx} - {sd.query_devices(input_device_idx)['name']}")
+            print(f"Output Device: {output_device_idx} - {sd.query_devices(output_device_idx)['name']}")
+            print(f"Sample Rate:   {self.RATE} Hz")
+            print(f"Threshold:     {self.threshold_db} dB")
             print(f"Priority Channels: {self.priority_channels}")
             print(f"Channel 3 Exclusive Mode: {self.channel_3_exclusive}")
+            print(f"Hold Time:     {self.channel_hold_time} seconds")
+            print("="*70)
             
             self.running = True
             
-            # Open streams
-            self.input_stream = self.p.open(
-                format=self.FORMAT,
-                channels=self.INPUT_CHANNELS,
-                rate=self.RATE,
-                input=True,
-                output=True,  # Duplex mode
-                input_device_index=input_device_idx,
-                output_device_index=output_device_idx,
-                frames_per_buffer=self.CHUNK,
-                stream_callback=self.process_audio,
-                output_channels=self.OUTPUT_CHANNELS
+            # Create and start stream
+            self.stream = sd.Stream(
+                samplerate=self.RATE,
+                blocksize=self.CHUNK,
+                device=(input_device_idx, output_device_idx),
+                channels=(self.INPUT_CHANNELS, self.OUTPUT_CHANNELS),
+                dtype=np.float32,
+                callback=self.audio_callback
             )
             
-            self.input_stream.start_stream()
-            print("\n\nRouter is running! Press Ctrl+C to stop.\n")
+            self.stream.start()
+            print("\n✓ Router is running! Press Ctrl+C to stop.\n")
             
             # Keep running
-            while self.running and self.input_stream.is_active():
+            while self.running:
                 time.sleep(0.1)
                 
         except KeyboardInterrupt:
-            print("\n\nStopping...")
+            print("\n\n" + "="*70)
+            print("STOPPING...")
+            print("="*70)
         except Exception as e:
-            print(f"\nError: {e}")
+            print(f"\n\nERROR: {e}")
+            print("\nTroubleshooting:")
+            print("- Make sure the Zoom H8 is connected and recognized")
+            print("- Check that device numbers are correct")
+            print("- Try different sample rates if 48000 Hz doesn't work")
         finally:
             self.stop()
     
     def stop(self):
         """Stop the audio router"""
         self.running = False
-        if self.input_stream:
-            self.input_stream.stop_stream()
-            self.input_stream.close()
-        if self.output_stream:
-            self.output_stream.stop_stream()
-            self.output_stream.close()
-        print("\nRouter stopped.")
-    
-    def __del__(self):
-        self.p.terminate()
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+        print("\n✓ Router stopped.\n")
 
 
 def main():
+    print("\n" + "="*70)
+    print("ZOOM H8 AUDIO CHANNEL ROUTER")
+    print("="*70)
+    
     router = AudioChannelRouter()
     
     # List available devices
     router.list_devices()
     
-    print("\n" + "="*50)
-    input_device = int(input("\nEnter INPUT device number (Zoom H8): "))
-    output_device = int(input("Enter OUTPUT device number (Virtual/Recording device): "))
+    # Get device selection
+    print("\nDEVICE SELECTION")
+    print("-" * 70)
+    input_device = int(input("Enter INPUT device number (Zoom H8): "))
+    output_device = int(input("Enter OUTPUT device number (Virtual/Recording): "))
     
     # Optional: Configure settings
-    print("\n=== Configuration ===")
-    configure = input("Configure settings? (y/n, default=n): ").lower()
+    print("\n" + "="*70)
+    print("CONFIGURATION (Optional)")
+    print("="*70)
+    configure = input("Would you like to configure settings? (y/n, default=n): ").lower()
     
     if configure == 'y':
-        router.threshold_db = float(input(f"Threshold in dB (default={router.threshold_db}): ") or router.threshold_db)
-        priority = input(f"Priority channels comma-separated (default={','.join(map(str, router.priority_channels))}): ")
+        print("\nCurrent settings:")
+        print(f"  Threshold: {router.threshold_db} dB")
+        print(f"  Priority channels: {router.priority_channels}")
+        print(f"  Channel 3 exclusive: {router.channel_3_exclusive}")
+        print(f"  Hold time: {router.channel_hold_time} seconds")
+        print()
+        
+        threshold = input(f"New threshold in dB (press Enter to keep {router.threshold_db}): ")
+        if threshold:
+            router.threshold_db = float(threshold)
+        
+        priority = input(f"Priority channels, comma-separated (press Enter to keep {','.join(map(str, router.priority_channels))}): ")
         if priority:
             router.priority_channels = [int(x.strip()) for x in priority.split(',')]
         
-        exclusive = input(f"Channel 3 exclusive mode? (y/n, default={'y' if router.channel_3_exclusive else 'n'}): ")
-        router.channel_3_exclusive = exclusive.lower() == 'y'
+        exclusive = input(f"Channel 3 exclusive mode? (y/n, press Enter to keep {'y' if router.channel_3_exclusive else 'n'}): ")
+        if exclusive:
+            router.channel_3_exclusive = exclusive.lower() == 'y'
+        
+        hold = input(f"Hold time in seconds (press Enter to keep {router.channel_hold_time}): ")
+        if hold:
+            router.channel_hold_time = float(hold)
     
     # Start routing
     router.start(input_device, output_device)
@@ -232,3 +254,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
