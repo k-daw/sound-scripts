@@ -12,6 +12,7 @@ import threading
 import time
 import wave
 import json
+import copy
 from datetime import datetime
 
 app = Flask(__name__)
@@ -33,6 +34,11 @@ class SimpleAudioRouter:
         # Config
         self.input_gain_db = 0
         self.output_gain_db = 0
+        
+        # Routing matrix: routing_matrix[input_channel][output_channel] = enabled (bool)
+        self.routing_matrix = {}
+        self.use_routing_matrix = False
+        self._routing_matrix_lock = threading.Lock()
         
         # Recording
         self.recording = False
@@ -101,24 +107,51 @@ class SimpleAudioRouter:
                 levels = self.calculate_levels(indata_gained)
                 self.current_levels = levels
                 
-                # Mix all input channels to stereo output
-                if self.input_channels == 1:
-                    # Mono to stereo
-                    mixed = indata_gained[:, 0]
-                else:
-                    # Sum all channels (preserves level better than averaging)
-                    # Use square root normalization to prevent clipping while preserving level
-                    mixed = np.sum(indata_gained, axis=1) / np.sqrt(self.input_channels)
+                # Thread-safe copy of routing matrix
+                with self._routing_matrix_lock:
+                    use_matrix = self.use_routing_matrix
+                    if use_matrix:
+                        routing_matrix_copy = copy.deepcopy(self.routing_matrix)
+                    else:
+                        routing_matrix_copy = None
                 
                 # Apply output gain
                 output_gain = self.db_to_linear(self.output_gain_db)
-                mixed = mixed * output_gain
-                mixed = np.clip(mixed, -1.0, 1.0)
                 
                 # Create output
                 outdata = np.zeros((self.CHUNK, self.output_channels), dtype=np.float32)
-                for ch in range(self.output_channels):
-                    outdata[:, ch] = mixed
+                
+                if use_matrix:
+                    # Routing matrix mode
+                    active_routes_per_output = np.zeros(self.output_channels, dtype=np.int32)
+                    
+                    for input_ch in range(self.input_channels):
+                        if input_ch in routing_matrix_copy:
+                            for output_ch in range(self.output_channels):
+                                if output_ch in routing_matrix_copy[input_ch] and routing_matrix_copy[input_ch][output_ch]:
+                                    channel_data = indata_gained[:, input_ch] * output_gain
+                                    outdata[:, output_ch] += channel_data
+                                    active_routes_per_output[output_ch] += 1
+                    
+                    # Normalize if multiple inputs routed to same output
+                    for output_ch in range(self.output_channels):
+                        if active_routes_per_output[output_ch] > 1:
+                            outdata[:, output_ch] /= active_routes_per_output[output_ch]
+                else:
+                    # Simple mixing mode (original behavior)
+                    if self.input_channels == 1:
+                        mixed = indata_gained[:, 0]
+                    else:
+                        mixed = np.sum(indata_gained, axis=1) / np.sqrt(self.input_channels)
+                    
+                    mixed = mixed * output_gain
+                    mixed = np.clip(mixed, -1.0, 1.0)
+                    
+                    for ch in range(self.output_channels):
+                        outdata[:, ch] = mixed
+                
+                # Final clip
+                outdata = np.clip(outdata, -1.0, 1.0)
                 
                 # Record if enabled
                 if self.recording:
@@ -163,7 +196,20 @@ class SimpleAudioRouter:
             output_info = sd.query_devices(output_device)
             
             self.input_channels = min(int(input_info['max_input_channels']), 10)
-            self.output_channels = int(output_info['max_output_channels'])
+            self.output_channels = min(int(output_info['max_output_channels']), 8)
+            
+            # Initialize routing matrix
+            with self._routing_matrix_lock:
+                new_routing_matrix = {}
+                for i in range(self.input_channels):
+                    if i in self.routing_matrix:
+                        new_routing_matrix[i] = {
+                            out_ch: self.routing_matrix[i].get(out_ch, False)
+                            for out_ch in range(self.output_channels)
+                        }
+                    else:
+                        new_routing_matrix[i] = {}
+                self.routing_matrix = new_routing_matrix
             
             self.input_device = input_device
             self.output_device = output_device
@@ -186,11 +232,18 @@ class SimpleAudioRouter:
     
     def get_config(self):
         """Get current configuration"""
+        with self._routing_matrix_lock:
+            routing_matrix_copy = copy.deepcopy(self.routing_matrix)
+            use_routing_matrix = self.use_routing_matrix
         return {
             'input_gain_db': self.input_gain_db,
             'output_gain_db': self.output_gain_db,
             'input_device': self.input_device,
             'output_device': self.output_device,
+            'use_routing_matrix': use_routing_matrix,
+            'routing_matrix': routing_matrix_copy,
+            'input_channels': self.input_channels,
+            'output_channels': self.output_channels,
             # Frontend expects these but we don't use them in simple router
             'threshold_db': -40,
             'priority_channels': [1, 3],
@@ -204,6 +257,18 @@ class SimpleAudioRouter:
             self.input_gain_db = float(config['input_gain_db'])
         if 'output_gain_db' in config:
             self.output_gain_db = float(config['output_gain_db'])
+        if 'use_routing_matrix' in config:
+            with self._routing_matrix_lock:
+                self.use_routing_matrix = config['use_routing_matrix']
+        if 'routing_matrix' in config:
+            with self._routing_matrix_lock:
+                for input_ch, output_channels in config['routing_matrix'].items():
+                    input_ch = int(input_ch)
+                    if input_ch not in self.routing_matrix:
+                        self.routing_matrix[input_ch] = {}
+                    for output_ch, enabled in output_channels.items():
+                        output_ch = int(output_ch)
+                        self.routing_matrix[input_ch][output_ch] = bool(enabled)
     
     def start_recording(self, filename=None):
         """Start recording to WAV file"""
@@ -385,6 +450,42 @@ def handle_connect():
 @socketio.on('disconnect')
 def handle_disconnect():
     print('Client disconnected')
+
+@app.route('/api/routing-matrix', methods=['GET'])
+def get_routing_matrix():
+    """Get the current routing matrix configuration"""
+    try:
+        with router._routing_matrix_lock:
+            routing_matrix_copy = copy.deepcopy(router.routing_matrix)
+            use_routing_matrix = router.use_routing_matrix
+        return jsonify({
+            'use_routing_matrix': use_routing_matrix,
+            'routing_matrix': routing_matrix_copy,
+            'input_channels': router.input_channels,
+            'output_channels': router.output_channels
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/routing-matrix', methods=['POST'])
+def update_routing_matrix():
+    """Update the routing matrix configuration"""
+    try:
+        data = request.json
+        with router._routing_matrix_lock:
+            if 'use_routing_matrix' in data:
+                router.use_routing_matrix = bool(data['use_routing_matrix'])
+            if 'routing_matrix' in data:
+                for input_ch, output_channels in data['routing_matrix'].items():
+                    input_ch = int(input_ch)
+                    if input_ch not in router.routing_matrix:
+                        router.routing_matrix[input_ch] = {}
+                    for output_ch, enabled in output_channels.items():
+                        output_ch = int(output_ch)
+                        router.routing_matrix[input_ch][output_ch] = bool(enabled)
+        return jsonify({'status': 'updated'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     print("=" * 50)

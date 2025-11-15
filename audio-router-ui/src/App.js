@@ -34,17 +34,36 @@ function App() {
   const [lastLevelUpdate, setLastLevelUpdate] = useState(null);
   const [showDebug, setShowDebug] = useState(false);
   const [debugInfo, setDebugInfo] = useState(null);
+  
+  // Routing matrix state
+  const [routingMatrix, setRoutingMatrix] = useState({});
+  const [useRoutingMatrix, setUseRoutingMatrix] = useState(false);
+  const [inputChannels, setInputChannels] = useState(10);
+  const [outputChannels, setOutputChannels] = useState(2);
+  const [showRoutingMatrix, setShowRoutingMatrix] = useState(false);
 
   // Fetch devices on mount
   useEffect(() => {
     fetchDevices();
     fetchConfig();
     fetchPresets();
+    fetchRoutingMatrix();
     
     const statusInterval = setInterval(fetchStatus, 1000);
     
     return () => clearInterval(statusInterval);
   }, []);
+  
+  // Fetch routing matrix when devices change
+  useEffect(() => {
+    if (inputDevice !== null && outputDevice !== null) {
+      // Small delay to let backend update channel counts
+      const timer = setTimeout(() => {
+        fetchRoutingMatrix();
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [inputDevice, outputDevice]);
 
   // Listen for real-time level updates
   useEffect(() => {
@@ -99,8 +118,83 @@ function App() {
       setConfig(data);
       setInputDevice(data.input_device);
       setOutputDevice(data.output_device);
+      if (data.use_routing_matrix !== undefined) {
+        setUseRoutingMatrix(data.use_routing_matrix);
+      }
+      if (data.routing_matrix) {
+        setRoutingMatrix(data.routing_matrix);
+      }
+      if (data.input_channels) {
+        setInputChannels(data.input_channels);
+      }
+      if (data.output_channels) {
+        setOutputChannels(data.output_channels);
+      }
     } catch (err) {
       console.error('Failed to fetch config:', err);
+    }
+  };
+  
+  const fetchRoutingMatrix = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/routing-matrix`);
+      const data = await res.json();
+      if (data.use_routing_matrix !== undefined) {
+        setUseRoutingMatrix(data.use_routing_matrix);
+      }
+      if (data.routing_matrix) {
+        setRoutingMatrix(data.routing_matrix);
+      }
+      if (data.input_channels) {
+        setInputChannels(data.input_channels);
+      }
+      if (data.output_channels) {
+        setOutputChannels(data.output_channels);
+      }
+    } catch (err) {
+      console.error('Failed to fetch routing matrix:', err);
+    }
+  };
+  
+  const updateRoutingMatrix = async (inputCh, outputCh, enabled) => {
+    try {
+      // Update local state first for immediate UI feedback
+      const newMatrix = { ...routingMatrix };
+      if (!newMatrix[inputCh]) {
+        newMatrix[inputCh] = {};
+      }
+      newMatrix[inputCh][outputCh] = enabled;
+      setRoutingMatrix(newMatrix);
+      
+      // Send update to backend
+      await fetch(`${API_BASE}/routing-matrix`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          routing_matrix: newMatrix
+        })
+      });
+    } catch (err) {
+      console.error('Failed to update routing matrix:', err);
+      // Revert on error
+      fetchRoutingMatrix();
+    }
+  };
+  
+  const toggleRoutingMatrixMode = async () => {
+    try {
+      const newValue = !useRoutingMatrix;
+      setUseRoutingMatrix(newValue);
+      await fetch(`${API_BASE}/routing-matrix`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          use_routing_matrix: newValue
+        })
+      });
+    } catch (err) {
+      console.error('Failed to toggle routing matrix mode:', err);
+      fetchRoutingMatrix();
     }
   };
 
@@ -329,6 +423,96 @@ function App() {
           </div>
         </div>
 
+        {/* Routing Matrix */}
+        <div className="bg-slate-800 rounded-xl p-6 mb-6 border border-slate-700">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-xl font-semibold">Channel Routing Matrix</h2>
+            <div className="flex items-center gap-4">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={useRoutingMatrix}
+                  onChange={toggleRoutingMatrixMode}
+                  className="w-5 h-5 rounded"
+                />
+                <span className="text-sm">Enable Matrix Routing</span>
+              </label>
+              <button
+                onClick={() => setShowRoutingMatrix(!showRoutingMatrix)}
+                className="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm transition"
+              >
+                {showRoutingMatrix ? 'Hide' : 'Show'} Matrix
+              </button>
+            </div>
+          </div>
+          
+          {showRoutingMatrix && (
+            <div className="overflow-x-auto">
+              <div className="inline-block min-w-full">
+                <table className="w-full border-collapse">
+                  <thead>
+                    <tr>
+                      <th className="bg-slate-700 p-2 text-left text-sm font-medium border border-slate-600">
+                        Input → Output
+                      </th>
+                      {Array.from({ length: outputChannels }, (_, i) => (
+                        <th
+                          key={i}
+                          className="bg-slate-700 p-2 text-center text-sm font-medium border border-slate-600 min-w-[60px]"
+                        >
+                          Out {i + 1}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Array.from({ length: inputChannels }, (_, inputIdx) => (
+                      <tr key={inputIdx} className="hover:bg-slate-700/50">
+                        <td className="bg-slate-700/30 p-2 text-sm font-medium border border-slate-600">
+                          <div className="flex items-center gap-2">
+                            <span>Input {inputIdx + 1}</span>
+                            {levels[inputIdx] > -90 && (
+                              <span className="text-xs text-slate-400">
+                                ({levels[inputIdx].toFixed(0)} dB)
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                        {Array.from({ length: outputChannels }, (_, outputIdx) => {
+                          const isEnabled = routingMatrix[inputIdx]?.[outputIdx] || false;
+                          return (
+                            <td
+                              key={outputIdx}
+                              className="p-2 text-center border border-slate-600"
+                            >
+                              <label className="flex items-center justify-center cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={isEnabled}
+                                  onChange={(e) =>
+                                    updateRoutingMatrix(inputIdx, outputIdx, e.target.checked)
+                                  }
+                                  disabled={!useRoutingMatrix}
+                                  className="w-5 h-5 rounded cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                                />
+                              </label>
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="mt-3 text-xs text-slate-400">
+                {useRoutingMatrix
+                  ? 'Check boxes to route input channels to output channels. Multiple inputs can be routed to the same output (they will be mixed).'
+                  : 'Enable Matrix Routing to use the routing matrix instead of automatic channel selection.'}
+              </p>
+            </div>
+          )}
+        </div>
+
         {/* Channel Levels */}
         <div className="bg-slate-800 rounded-xl p-6 mb-6 border border-slate-700">
           <div className="flex items-center justify-between mb-4">
@@ -338,7 +522,7 @@ function App() {
                 <p className="text-xs text-slate-500">Last update: {lastLevelUpdate}</p>
               )}
             </div>
-            {activeChannel && (
+            {!useRoutingMatrix && activeChannel && (
               <div className="flex items-center gap-2 px-4 py-2 bg-blue-600 rounded-lg">
                 <Circle className="w-4 h-4 fill-current animate-pulse" />
                 <span className="font-medium">Active: Channel {activeChannel}</span>
