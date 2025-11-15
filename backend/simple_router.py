@@ -40,10 +40,19 @@ class SimpleAudioRouter:
         self.use_routing_matrix = False
         self._routing_matrix_lock = threading.Lock()
         
-        # Noise gate: per-channel threshold in dB (default -40dB)
-        # If channel level is below threshold, it won't be routed to output
-        self.noise_gate_thresholds = {}  # channel_index -> threshold_db
-        self.default_noise_gate_threshold = -40.0
+        # Noise gate: per-channel parameters
+        # Structure: channel_index -> {threshold, attack, release, hold, range}
+        self.noise_gate_params = {}  # channel_index -> dict of parameters
+        self.default_noise_gate = {
+            'threshold': -40.0,  # dB - level below which gate closes
+            'attack': 0.001,     # seconds - time to open gate
+            'release': 0.050,    # seconds - time to close gate
+            'hold': 0.010,       # seconds - minimum time gate stays open
+            'range': -100.0      # dB - reduction when gate is closed (negative = mute)
+        }
+        
+        # Gate state tracking per channel
+        self.gate_state = {}  # channel_index -> {is_open, open_time, close_time, current_gain}
         
         # Recording
         self.recording = False
@@ -126,23 +135,79 @@ class SimpleAudioRouter:
                 # Create output
                 outdata = np.zeros((self.CHUNK, self.output_channels), dtype=np.float32)
                 
+                # Process noise gates for all channels
+                chunk_time = self.CHUNK / self.RATE  # Time duration of this chunk
+                current_time = time.time()
+                
+                # Calculate gate gains for each channel
+                gate_gains = np.ones(self.input_channels, dtype=np.float32)
+                for input_ch in range(self.input_channels):
+                    params = self.noise_gate_params.get(input_ch, self.default_noise_gate)
+                    state = self.gate_state.get(input_ch, {
+                        'is_open': False,
+                        'open_time': 0.0,
+                        'close_time': 0.0,
+                        'current_gain': 0.0
+                    })
+                    
+                    channel_level = levels[input_ch] if input_ch < len(levels) else -100.0
+                    threshold = params['threshold']
+                    attack = params['attack']
+                    release = params['release']
+                    hold = params['hold']
+                    range_db = params['range']
+                    range_linear = self.db_to_linear(range_db)
+                    
+                    # Determine if gate should be open based on level
+                    should_be_open = channel_level >= threshold
+                    
+                    # Update gate state with attack/release/hold logic
+                    if should_be_open:
+                        if not state['is_open']:
+                            # Start opening
+                            state['open_time'] = current_time
+                            state['is_open'] = True
+                        # Gate is or should be open
+                        if state['current_gain'] < 1.0:
+                            # Apply attack
+                            attack_rate = chunk_time / attack if attack > 0 else 1.0
+                            state['current_gain'] = min(1.0, state['current_gain'] + attack_rate)
+                    else:
+                        # Signal below threshold
+                        if state['is_open']:
+                            # Check hold time
+                            time_since_open = current_time - state['open_time']
+                            if time_since_open < hold:
+                                # Still in hold period, keep gate open
+                                should_be_open = True
+                            else:
+                                # Start closing
+                                state['close_time'] = current_time
+                                state['is_open'] = False
+                        
+                        if not should_be_open:
+                            # Apply release
+                            release_rate = chunk_time / release if release > 0 else 1.0
+                            state['current_gain'] = max(range_linear, state['current_gain'] - release_rate)
+                    
+                    # Store updated state
+                    self.gate_state[input_ch] = state
+                    gate_gains[input_ch] = state['current_gain']
+                
                 if use_matrix:
                     # Routing matrix mode
                     active_routes_per_output = np.zeros(self.output_channels, dtype=np.int32)
                     
                     for input_ch in range(self.input_channels):
-                        # Check noise gate for this channel
-                        threshold = self.noise_gate_thresholds.get(input_ch, self.default_noise_gate_threshold)
-                        channel_level = levels[input_ch] if input_ch < len(levels) else -100.0
-                        
-                        # Skip this channel if below noise gate threshold
-                        if channel_level < threshold:
+                        # Apply gate gain to channel
+                        gate_gain = gate_gains[input_ch]
+                        if gate_gain <= 0.001:  # Effectively muted
                             continue
                         
                         if input_ch in routing_matrix_copy:
                             for output_ch in range(self.output_channels):
                                 if output_ch in routing_matrix_copy[input_ch] and routing_matrix_copy[input_ch][output_ch]:
-                                    channel_data = indata_gained[:, input_ch] * output_gain
+                                    channel_data = indata_gained[:, input_ch] * gate_gain * output_gain
                                     outdata[:, output_ch] += channel_data
                                     active_routes_per_output[output_ch] += 1
                     
@@ -152,24 +217,22 @@ class SimpleAudioRouter:
                             outdata[:, output_ch] /= active_routes_per_output[output_ch]
                 else:
                     # Simple mixing mode (original behavior)
-                    # Apply noise gate: only mix channels above their threshold
+                    # Apply noise gate: mix channels with their gate gains applied
                     channels_to_mix = []
                     for input_ch in range(self.input_channels):
-                        threshold = self.noise_gate_thresholds.get(input_ch, self.default_noise_gate_threshold)
-                        channel_level = levels[input_ch] if input_ch < len(levels) else -100.0
-                        
-                        # Only include channels above noise gate threshold
-                        if channel_level >= threshold:
-                            channels_to_mix.append(input_ch)
+                        gate_gain = gate_gains[input_ch]
+                        if gate_gain > 0.001:  # Only include if not effectively muted
+                            channels_to_mix.append((input_ch, gate_gain))
                     
                     if len(channels_to_mix) == 0:
-                        # All channels below threshold, output silence
+                        # All channels gated, output silence
                         mixed = np.zeros(self.CHUNK, dtype=np.float32)
                     elif len(channels_to_mix) == 1:
-                        mixed = indata_gained[:, channels_to_mix[0]]
+                        input_ch, gate_gain = channels_to_mix[0]
+                        mixed = indata_gained[:, input_ch] * gate_gain
                     else:
-                        # Sum only the channels that passed the noise gate
-                        mixed = np.sum([indata_gained[:, ch] for ch in channels_to_mix], axis=0) / np.sqrt(len(channels_to_mix))
+                        # Sum channels with their gate gains applied
+                        mixed = np.sum([indata_gained[:, ch] * gain for ch, gain in channels_to_mix], axis=0) / np.sqrt(len(channels_to_mix))
                     
                     mixed = mixed * output_gain
                     mixed = np.clip(mixed, -1.0, 1.0)
@@ -238,10 +301,17 @@ class SimpleAudioRouter:
                         new_routing_matrix[i] = {}
                 self.routing_matrix = new_routing_matrix
             
-            # Initialize noise gate thresholds for new channels (if not already set)
+            # Initialize noise gate parameters for new channels (if not already set)
             for i in range(self.input_channels):
-                if i not in self.noise_gate_thresholds:
-                    self.noise_gate_thresholds[i] = self.default_noise_gate_threshold
+                if i not in self.noise_gate_params:
+                    self.noise_gate_params[i] = copy.deepcopy(self.default_noise_gate)
+                if i not in self.gate_state:
+                    self.gate_state[i] = {
+                        'is_open': False,
+                        'open_time': 0.0,
+                        'close_time': 0.0,
+                        'current_gain': 0.0  # linear gain (0.0 to 1.0)
+                    }
             
             self.input_device = input_device
             self.output_device = output_device
@@ -276,8 +346,8 @@ class SimpleAudioRouter:
             'routing_matrix': routing_matrix_copy,
             'input_channels': self.input_channels,
             'output_channels': self.output_channels,
-            'noise_gate_thresholds': dict(self.noise_gate_thresholds),
-            'default_noise_gate_threshold': self.default_noise_gate_threshold,
+            'noise_gate_params': {str(k): copy.deepcopy(v) for k, v in self.noise_gate_params.items()},
+            'default_noise_gate': copy.deepcopy(self.default_noise_gate),
             # Frontend expects these but we don't use them in simple router
             'threshold_db': -40,
             'priority_channels': [1, 3],
@@ -303,12 +373,20 @@ class SimpleAudioRouter:
                     for output_ch, enabled in output_channels.items():
                         output_ch = int(output_ch)
                         self.routing_matrix[input_ch][output_ch] = bool(enabled)
-        if 'noise_gate_thresholds' in config:
-            for channel, threshold in config['noise_gate_thresholds'].items():
+        if 'noise_gate_params' in config:
+            for channel, params in config['noise_gate_params'].items():
                 channel = int(channel)
-                self.noise_gate_thresholds[channel] = float(threshold)
-        if 'default_noise_gate_threshold' in config:
-            self.default_noise_gate_threshold = float(config['default_noise_gate_threshold'])
+                if channel not in self.noise_gate_params:
+                    self.noise_gate_params[channel] = copy.deepcopy(self.default_noise_gate)
+                # Update individual parameters
+                if isinstance(params, dict):
+                    for key, value in params.items():
+                        if key in self.noise_gate_params[channel]:
+                            self.noise_gate_params[channel][key] = float(value)
+        if 'default_noise_gate' in config:
+            for key, value in config['default_noise_gate'].items():
+                if key in self.default_noise_gate:
+                    self.default_noise_gate[key] = float(value)
     
     def start_recording(self, filename=None):
         """Start recording to WAV file"""
@@ -529,11 +607,11 @@ def update_routing_matrix():
 
 @app.route('/api/noise-gate', methods=['GET'])
 def get_noise_gate():
-    """Get noise gate thresholds for all channels"""
+    """Get noise gate parameters for all channels"""
     try:
         return jsonify({
-            'noise_gate_thresholds': dict(router.noise_gate_thresholds),
-            'default_noise_gate_threshold': router.default_noise_gate_threshold,
+            'noise_gate_params': {str(k): copy.deepcopy(v) for k, v in router.noise_gate_params.items()},
+            'default_noise_gate': copy.deepcopy(router.default_noise_gate),
             'input_channels': router.input_channels
         })
     except Exception as e:
@@ -541,21 +619,45 @@ def get_noise_gate():
 
 @app.route('/api/noise-gate', methods=['POST'])
 def update_noise_gate():
-    """Update noise gate threshold for a specific channel or set default"""
+    """Update noise gate parameters for a specific channel or set default"""
     try:
         data = request.json
-        if 'channel' in data and 'threshold' in data:
-            # Update specific channel threshold
+        if 'channel' in data:
+            # Update specific channel parameters
             channel = int(data['channel'])
-            threshold = float(data['threshold'])
-            router.noise_gate_thresholds[channel] = threshold
-        elif 'default_threshold' in data:
-            # Update default threshold
-            router.default_noise_gate_threshold = float(data['default_threshold'])
-        elif 'thresholds' in data:
+            if channel not in router.noise_gate_params:
+                router.noise_gate_params[channel] = copy.deepcopy(router.default_noise_gate)
+            
+            # Update individual parameters if provided
+            if 'threshold' in data:
+                router.noise_gate_params[channel]['threshold'] = float(data['threshold'])
+            if 'attack' in data:
+                router.noise_gate_params[channel]['attack'] = float(data['attack'])
+            if 'release' in data:
+                router.noise_gate_params[channel]['release'] = float(data['release'])
+            if 'hold' in data:
+                router.noise_gate_params[channel]['hold'] = float(data['hold'])
+            if 'range' in data:
+                router.noise_gate_params[channel]['range'] = float(data['range'])
+            if 'params' in data:
+                # Bulk update all parameters for this channel
+                for key, value in data['params'].items():
+                    if key in router.noise_gate_params[channel]:
+                        router.noise_gate_params[channel][key] = float(value)
+        elif 'default_noise_gate' in data:
+            # Update default parameters
+            for key, value in data['default_noise_gate'].items():
+                if key in router.default_noise_gate:
+                    router.default_noise_gate[key] = float(value)
+        elif 'params' in data:
             # Bulk update multiple channels
-            for channel, threshold in data['thresholds'].items():
-                router.noise_gate_thresholds[int(channel)] = float(threshold)
+            for channel, params in data['params'].items():
+                channel = int(channel)
+                if channel not in router.noise_gate_params:
+                    router.noise_gate_params[channel] = copy.deepcopy(router.default_noise_gate)
+                for key, value in params.items():
+                    if key in router.noise_gate_params[channel]:
+                        router.noise_gate_params[channel][key] = float(value)
         return jsonify({'status': 'updated'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500

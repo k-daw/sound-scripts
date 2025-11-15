@@ -43,9 +43,16 @@ function App() {
   const [showRoutingMatrix, setShowRoutingMatrix] = useState(false);
   
   // Noise gate state
-  const [noiseGateThresholds, setNoiseGateThresholds] = useState({});
-  const [defaultNoiseGateThreshold, setDefaultNoiseGateThreshold] = useState(-40);
+  const [noiseGateParams, setNoiseGateParams] = useState({}); // channel -> {threshold, attack, release, hold, range}
+  const [defaultNoiseGate, setDefaultNoiseGate] = useState({
+    threshold: -40.0,
+    attack: 0.001,
+    release: 0.050,
+    hold: 0.010,
+    range: -100.0
+  });
   const [showNoiseGate, setShowNoiseGate] = useState(false);
+  const [expandedGateChannel, setExpandedGateChannel] = useState(null); // Which channel has expanded controls
 
   // Fetch devices on mount
   useEffect(() => {
@@ -137,11 +144,15 @@ function App() {
       if (data.output_channels) {
         setOutputChannels(data.output_channels);
       }
-      if (data.noise_gate_thresholds) {
-        setNoiseGateThresholds(data.noise_gate_thresholds);
+      if (data.noise_gate_params) {
+        const params = {};
+        for (const [key, value] of Object.entries(data.noise_gate_params)) {
+          params[parseInt(key)] = value;
+        }
+        setNoiseGateParams(params);
       }
-      if (data.default_noise_gate_threshold !== undefined) {
-        setDefaultNoiseGateThreshold(data.default_noise_gate_threshold);
+      if (data.default_noise_gate) {
+        setDefaultNoiseGate(data.default_noise_gate);
       }
     } catch (err) {
       console.error('Failed to fetch config:', err);
@@ -215,23 +226,31 @@ function App() {
     try {
       const res = await fetch(`${API_BASE}/noise-gate`);
       const data = await res.json();
-      if (data.noise_gate_thresholds) {
-        setNoiseGateThresholds(data.noise_gate_thresholds);
+      if (data.noise_gate_params) {
+        // Convert string keys to numbers
+        const params = {};
+        for (const [key, value] of Object.entries(data.noise_gate_params)) {
+          params[parseInt(key)] = value;
+        }
+        setNoiseGateParams(params);
       }
-      if (data.default_noise_gate_threshold !== undefined) {
-        setDefaultNoiseGateThreshold(data.default_noise_gate_threshold);
+      if (data.default_noise_gate) {
+        setDefaultNoiseGate(data.default_noise_gate);
       }
     } catch (err) {
       console.error('Failed to fetch noise gate:', err);
     }
   };
   
-  const updateNoiseGateThreshold = async (channel, threshold) => {
+  const updateNoiseGateParam = async (channel, paramName, value) => {
     try {
       // Update local state first for immediate UI feedback
-      const newThresholds = { ...noiseGateThresholds };
-      newThresholds[channel] = threshold;
-      setNoiseGateThresholds(newThresholds);
+      const newParams = { ...noiseGateParams };
+      if (!newParams[channel]) {
+        newParams[channel] = { ...defaultNoiseGate };
+      }
+      newParams[channel] = { ...newParams[channel], [paramName]: value };
+      setNoiseGateParams(newParams);
       
       // Send update to backend
       await fetch(`${API_BASE}/noise-gate`, {
@@ -239,7 +258,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           channel: channel,
-          threshold: threshold
+          [paramName]: value
         })
       });
     } catch (err) {
@@ -249,20 +268,28 @@ function App() {
     }
   };
   
-  const updateDefaultNoiseGateThreshold = async (threshold) => {
+  const updateDefaultNoiseGateParam = async (paramName, value) => {
     try {
-      setDefaultNoiseGateThreshold(threshold);
+      const newDefault = { ...defaultNoiseGate, [paramName]: value };
+      setDefaultNoiseGate(newDefault);
       await fetch(`${API_BASE}/noise-gate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          default_threshold: threshold
+          default_noise_gate: { [paramName]: value }
         })
       });
     } catch (err) {
       console.error('Failed to update default noise gate:', err);
       fetchNoiseGate();
     }
+  };
+  
+  const getGateParam = (channel, paramName) => {
+    if (noiseGateParams[channel] && noiseGateParams[channel][paramName] !== undefined) {
+      return noiseGateParams[channel][paramName];
+    }
+    return defaultNoiseGate[paramName];
   };
 
   const fetchStatus = async () => {
@@ -607,9 +634,7 @@ function App() {
           
           <div className="space-y-3">
             {levels.map((level, idx) => {
-              const threshold = noiseGateThresholds[idx] !== undefined 
-                ? noiseGateThresholds[idx] 
-                : defaultNoiseGateThreshold;
+              const threshold = getGateParam(idx, 'threshold');
               const isGated = level < threshold;
               
               return (
@@ -643,22 +668,105 @@ function App() {
                     </div>
                   </div>
                   
-                  {/* Noise Gate Control */}
+                  {/* Noise Gate Controls */}
                   {showNoiseGate && (
-                    <div className="ml-16 flex items-center gap-3">
-                      <label className="text-xs text-slate-400 w-24">Noise Gate:</label>
-                      <input
-                        type="range"
-                        min="-60"
-                        max="-10"
-                        step="1"
-                        value={threshold}
-                        onChange={(e) => updateNoiseGateThreshold(idx, parseFloat(e.target.value))}
-                        className="flex-1"
-                      />
-                      <div className="w-16 text-xs font-mono text-right text-slate-300">
-                        {threshold.toFixed(0)} dB
+                    <div className="ml-16 space-y-2 bg-slate-700/30 rounded-lg p-3">
+                      <div className="flex items-center gap-2 mb-2">
+                        <button
+                          onClick={() => setExpandedGateChannel(expandedGateChannel === idx ? null : idx)}
+                          className="text-xs text-slate-300 hover:text-white transition"
+                        >
+                          {expandedGateChannel === idx ? '▼' : '▶'} Advanced
+                        </button>
+                        <span className="text-xs text-slate-500">|</span>
+                        <span className="text-xs text-slate-400">Channel {idx + 1} Gate</span>
                       </div>
+                      
+                      {/* Basic: Threshold */}
+                      <div className="flex items-center gap-3">
+                        <label className="text-xs text-slate-400 w-20">Threshold:</label>
+                        <input
+                          type="range"
+                          min="-60"
+                          max="-10"
+                          step="1"
+                          value={threshold}
+                          onChange={(e) => updateNoiseGateParam(idx, 'threshold', parseFloat(e.target.value))}
+                          className="flex-1"
+                        />
+                        <div className="w-16 text-xs font-mono text-right text-slate-300">
+                          {threshold.toFixed(0)} dB
+                        </div>
+                      </div>
+                      
+                      {/* Advanced Parameters */}
+                      {expandedGateChannel === idx && (
+                        <div className="mt-3 pt-3 border-t border-slate-600 space-y-2">
+                          <div className="flex items-center gap-3">
+                            <label className="text-xs text-slate-400 w-20">Attack:</label>
+                            <input
+                              type="range"
+                              min="0.0001"
+                              max="0.1"
+                              step="0.0001"
+                              value={getGateParam(idx, 'attack')}
+                              onChange={(e) => updateNoiseGateParam(idx, 'attack', parseFloat(e.target.value))}
+                              className="flex-1"
+                            />
+                            <div className="w-20 text-xs font-mono text-right text-slate-300">
+                              {(getGateParam(idx, 'attack') * 1000).toFixed(1)} ms
+                            </div>
+                          </div>
+                          
+                          <div className="flex items-center gap-3">
+                            <label className="text-xs text-slate-400 w-20">Release:</label>
+                            <input
+                              type="range"
+                              min="0.001"
+                              max="1.0"
+                              step="0.001"
+                              value={getGateParam(idx, 'release')}
+                              onChange={(e) => updateNoiseGateParam(idx, 'release', parseFloat(e.target.value))}
+                              className="flex-1"
+                            />
+                            <div className="w-20 text-xs font-mono text-right text-slate-300">
+                              {(getGateParam(idx, 'release') * 1000).toFixed(0)} ms
+                            </div>
+                          </div>
+                          
+                          <div className="flex items-center gap-3">
+                            <label className="text-xs text-slate-400 w-20">Hold:</label>
+                            <input
+                              type="range"
+                              min="0.001"
+                              max="2.0"
+                              step="0.001"
+                              value={getGateParam(idx, 'hold')}
+                              onChange={(e) => updateNoiseGateParam(idx, 'hold', parseFloat(e.target.value))}
+                              className="flex-1"
+                            />
+                            <div className="w-20 text-xs font-mono text-right text-slate-300">
+                              {(getGateParam(idx, 'hold') * 1000).toFixed(0)} ms
+                            </div>
+                          </div>
+                          
+                          <div className="flex items-center gap-3">
+                            <label className="text-xs text-slate-400 w-20">Range:</label>
+                            <input
+                              type="range"
+                              min="-100"
+                              max="0"
+                              step="1"
+                              value={getGateParam(idx, 'range')}
+                              onChange={(e) => updateNoiseGateParam(idx, 'range', parseFloat(e.target.value))}
+                              className="flex-1"
+                            />
+                            <div className="w-20 text-xs font-mono text-right text-slate-300">
+                              {getGateParam(idx, 'range').toFixed(0)} dB
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -668,23 +776,90 @@ function App() {
           
           {showNoiseGate && (
             <div className="mt-4 pt-4 border-t border-slate-700">
-              <div className="flex items-center gap-3">
-                <label className="text-sm text-slate-400">Default Threshold:</label>
-                <input
-                  type="range"
-                  min="-60"
-                  max="-10"
-                  step="1"
-                  value={defaultNoiseGateThreshold}
-                  onChange={(e) => updateDefaultNoiseGateThreshold(parseFloat(e.target.value))}
-                  className="flex-1"
-                />
-                <div className="w-16 text-sm font-mono text-right text-slate-300">
-                  {defaultNoiseGateThreshold.toFixed(0)} dB
+              <h3 className="text-sm font-semibold mb-3 text-slate-300">Default Gate Parameters</h3>
+              <div className="space-y-2">
+                <div className="flex items-center gap-3">
+                  <label className="text-xs text-slate-400 w-20">Threshold:</label>
+                  <input
+                    type="range"
+                    min="-60"
+                    max="-10"
+                    step="1"
+                    value={defaultNoiseGate.threshold}
+                    onChange={(e) => updateDefaultNoiseGateParam('threshold', parseFloat(e.target.value))}
+                    className="flex-1"
+                  />
+                  <div className="w-16 text-xs font-mono text-right text-slate-300">
+                    {defaultNoiseGate.threshold.toFixed(0)} dB
+                  </div>
+                </div>
+                
+                <div className="flex items-center gap-3">
+                  <label className="text-xs text-slate-400 w-20">Attack:</label>
+                  <input
+                    type="range"
+                    min="0.0001"
+                    max="0.1"
+                    step="0.0001"
+                    value={defaultNoiseGate.attack}
+                    onChange={(e) => updateDefaultNoiseGateParam('attack', parseFloat(e.target.value))}
+                    className="flex-1"
+                  />
+                  <div className="w-20 text-xs font-mono text-right text-slate-300">
+                    {(defaultNoiseGate.attack * 1000).toFixed(1)} ms
+                  </div>
+                </div>
+                
+                <div className="flex items-center gap-3">
+                  <label className="text-xs text-slate-400 w-20">Release:</label>
+                  <input
+                    type="range"
+                    min="0.001"
+                    max="1.0"
+                    step="0.001"
+                    value={defaultNoiseGate.release}
+                    onChange={(e) => updateDefaultNoiseGateParam('release', parseFloat(e.target.value))}
+                    className="flex-1"
+                  />
+                  <div className="w-20 text-xs font-mono text-right text-slate-300">
+                    {(defaultNoiseGate.release * 1000).toFixed(0)} ms
+                  </div>
+                </div>
+                
+                <div className="flex items-center gap-3">
+                  <label className="text-xs text-slate-400 w-20">Hold:</label>
+                  <input
+                    type="range"
+                    min="0.001"
+                    max="2.0"
+                    step="0.001"
+                    value={defaultNoiseGate.hold}
+                    onChange={(e) => updateDefaultNoiseGateParam('hold', parseFloat(e.target.value))}
+                    className="flex-1"
+                  />
+                  <div className="w-20 text-xs font-mono text-right text-slate-300">
+                    {(defaultNoiseGate.hold * 1000).toFixed(0)} ms
+                  </div>
+                </div>
+                
+                <div className="flex items-center gap-3">
+                  <label className="text-xs text-slate-400 w-20">Range:</label>
+                  <input
+                    type="range"
+                    min="-100"
+                    max="0"
+                    step="1"
+                    value={defaultNoiseGate.range}
+                    onChange={(e) => updateDefaultNoiseGateParam('range', parseFloat(e.target.value))}
+                    className="flex-1"
+                  />
+                  <div className="w-20 text-xs font-mono text-right text-slate-300">
+                    {defaultNoiseGate.range.toFixed(0)} dB
+                  </div>
                 </div>
               </div>
-              <p className="mt-2 text-xs text-slate-500">
-                Channels below their noise gate threshold will not be routed to the output. Yellow line indicates threshold.
+              <p className="mt-3 text-xs text-slate-500">
+                Noise gate parameters control when and how channels are muted. Threshold sets the level, attack/release control smoothness, hold prevents rapid switching, and range sets reduction when closed.
               </p>
             </div>
           )}
