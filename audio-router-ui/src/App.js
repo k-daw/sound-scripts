@@ -41,6 +41,11 @@ function App() {
   const [inputChannels, setInputChannels] = useState(10);
   const [outputChannels, setOutputChannels] = useState(2);
   const [showRoutingMatrix, setShowRoutingMatrix] = useState(false);
+  
+  // Noise gate state
+  const [noiseGateThresholds, setNoiseGateThresholds] = useState({});
+  const [defaultNoiseGateThreshold, setDefaultNoiseGateThreshold] = useState(-40);
+  const [showNoiseGate, setShowNoiseGate] = useState(false);
 
   // Fetch devices on mount
   useEffect(() => {
@@ -48,6 +53,7 @@ function App() {
     fetchConfig();
     fetchPresets();
     fetchRoutingMatrix();
+    fetchNoiseGate();
     
     const statusInterval = setInterval(fetchStatus, 1000);
     
@@ -60,6 +66,7 @@ function App() {
       // Small delay to let backend update channel counts
       const timer = setTimeout(() => {
         fetchRoutingMatrix();
+        fetchNoiseGate();
       }, 100);
       return () => clearTimeout(timer);
     }
@@ -130,6 +137,12 @@ function App() {
       if (data.output_channels) {
         setOutputChannels(data.output_channels);
       }
+      if (data.noise_gate_thresholds) {
+        setNoiseGateThresholds(data.noise_gate_thresholds);
+      }
+      if (data.default_noise_gate_threshold !== undefined) {
+        setDefaultNoiseGateThreshold(data.default_noise_gate_threshold);
+      }
     } catch (err) {
       console.error('Failed to fetch config:', err);
     }
@@ -195,6 +208,60 @@ function App() {
     } catch (err) {
       console.error('Failed to toggle routing matrix mode:', err);
       fetchRoutingMatrix();
+    }
+  };
+  
+  const fetchNoiseGate = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/noise-gate`);
+      const data = await res.json();
+      if (data.noise_gate_thresholds) {
+        setNoiseGateThresholds(data.noise_gate_thresholds);
+      }
+      if (data.default_noise_gate_threshold !== undefined) {
+        setDefaultNoiseGateThreshold(data.default_noise_gate_threshold);
+      }
+    } catch (err) {
+      console.error('Failed to fetch noise gate:', err);
+    }
+  };
+  
+  const updateNoiseGateThreshold = async (channel, threshold) => {
+    try {
+      // Update local state first for immediate UI feedback
+      const newThresholds = { ...noiseGateThresholds };
+      newThresholds[channel] = threshold;
+      setNoiseGateThresholds(newThresholds);
+      
+      // Send update to backend
+      await fetch(`${API_BASE}/noise-gate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          channel: channel,
+          threshold: threshold
+        })
+      });
+    } catch (err) {
+      console.error('Failed to update noise gate:', err);
+      // Revert on error
+      fetchNoiseGate();
+    }
+  };
+  
+  const updateDefaultNoiseGateThreshold = async (threshold) => {
+    try {
+      setDefaultNoiseGateThreshold(threshold);
+      await fetch(`${API_BASE}/noise-gate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          default_threshold: threshold
+        })
+      });
+    } catch (err) {
+      console.error('Failed to update default noise gate:', err);
+      fetchNoiseGate();
     }
   };
 
@@ -522,35 +589,105 @@ function App() {
                 <p className="text-xs text-slate-500">Last update: {lastLevelUpdate}</p>
               )}
             </div>
-            {!useRoutingMatrix && activeChannel && (
-              <div className="flex items-center gap-2 px-4 py-2 bg-blue-600 rounded-lg">
-                <Circle className="w-4 h-4 fill-current animate-pulse" />
-                <span className="font-medium">Active: Channel {activeChannel}</span>
-              </div>
-            )}
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => setShowNoiseGate(!showNoiseGate)}
+                className="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm transition"
+              >
+                {showNoiseGate ? 'Hide' : 'Show'} Noise Gate
+              </button>
+              {!useRoutingMatrix && activeChannel && (
+                <div className="flex items-center gap-2 px-4 py-2 bg-blue-600 rounded-lg">
+                  <Circle className="w-4 h-4 fill-current animate-pulse" />
+                  <span className="font-medium">Active: Channel {activeChannel}</span>
+                </div>
+              )}
+            </div>
           </div>
           
           <div className="space-y-3">
-            {levels.map((level, idx) => (
-              <div key={idx} className="flex items-center gap-3">
-                <div className="w-12 text-sm font-medium text-slate-400">Ch {idx + 1}</div>
-                <div className="flex-1 h-8 bg-slate-700 rounded-lg overflow-hidden relative">
-                  <div
-                    className={`h-full transition-all duration-100 ${getLevelColor(level)} ${
-                      activeChannel === idx + 1 ? 'animate-pulse' : ''
-                    }`}
-                    style={{ width: getLevelWidth(level) }}
-                  />
-                  {activeChannel === idx + 1 && (
-                    <div className="absolute inset-0 border-2 border-white rounded-lg" />
+            {levels.map((level, idx) => {
+              const threshold = noiseGateThresholds[idx] !== undefined 
+                ? noiseGateThresholds[idx] 
+                : defaultNoiseGateThreshold;
+              const isGated = level < threshold;
+              
+              return (
+                <div key={idx} className="space-y-2">
+                  <div className="flex items-center gap-3">
+                    <div className="w-12 text-sm font-medium text-slate-400">Ch {idx + 1}</div>
+                    <div className="flex-1 h-8 bg-slate-700 rounded-lg overflow-hidden relative">
+                      <div
+                        className={`h-full transition-all duration-100 ${getLevelColor(level)} ${
+                          activeChannel === idx + 1 ? 'animate-pulse' : ''
+                        } ${isGated ? 'opacity-50' : ''}`}
+                        style={{ width: getLevelWidth(level) }}
+                      />
+                      {/* Noise gate threshold indicator */}
+                      <div
+                        className="absolute top-0 bottom-0 w-0.5 bg-yellow-400 opacity-60"
+                        style={{ left: getLevelWidth(threshold) }}
+                        title={`Noise Gate: ${threshold.toFixed(0)} dB`}
+                      />
+                      {activeChannel === idx + 1 && (
+                        <div className="absolute inset-0 border-2 border-white rounded-lg" />
+                      )}
+                      {isGated && (
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <span className="text-xs text-slate-500 font-medium">GATED</span>
+                        </div>
+                      )}
+                    </div>
+                    <div className="w-16 text-sm font-mono text-right">
+                      {level > -90 ? `${level.toFixed(0)} dB` : '---'}
+                    </div>
+                  </div>
+                  
+                  {/* Noise Gate Control */}
+                  {showNoiseGate && (
+                    <div className="ml-16 flex items-center gap-3">
+                      <label className="text-xs text-slate-400 w-24">Noise Gate:</label>
+                      <input
+                        type="range"
+                        min="-60"
+                        max="-10"
+                        step="1"
+                        value={threshold}
+                        onChange={(e) => updateNoiseGateThreshold(idx, parseFloat(e.target.value))}
+                        className="flex-1"
+                      />
+                      <div className="w-16 text-xs font-mono text-right text-slate-300">
+                        {threshold.toFixed(0)} dB
+                      </div>
+                    </div>
                   )}
                 </div>
-                <div className="w-16 text-sm font-mono text-right">
-                  {level > -90 ? `${level.toFixed(0)} dB` : '---'}
+              );
+            })}
+          </div>
+          
+          {showNoiseGate && (
+            <div className="mt-4 pt-4 border-t border-slate-700">
+              <div className="flex items-center gap-3">
+                <label className="text-sm text-slate-400">Default Threshold:</label>
+                <input
+                  type="range"
+                  min="-60"
+                  max="-10"
+                  step="1"
+                  value={defaultNoiseGateThreshold}
+                  onChange={(e) => updateDefaultNoiseGateThreshold(parseFloat(e.target.value))}
+                  className="flex-1"
+                />
+                <div className="w-16 text-sm font-mono text-right text-slate-300">
+                  {defaultNoiseGateThreshold.toFixed(0)} dB
                 </div>
               </div>
-            ))}
-          </div>
+              <p className="mt-2 text-xs text-slate-500">
+                Channels below their noise gate threshold will not be routed to the output. Yellow line indicates threshold.
+              </p>
+            </div>
+          )}
         </div>
 
         {/* Configuration Panel */}
