@@ -53,6 +53,18 @@ function App() {
   });
   const [showNoiseGate, setShowNoiseGate] = useState(false);
   const [expandedGateChannel, setExpandedGateChannel] = useState(null); // Which channel has expanded controls
+  
+  // Output target state
+  const [outputLevelTargets, setOutputLevelTargets] = useState({});
+  const [defaultOutputTarget, setDefaultOutputTarget] = useState({
+    enabled: false,
+    min_db: -18.0,
+    max_db: -6.0,
+    max_boost_db: 12.0,
+    max_cut_db: 12.0
+  });
+  const [showOutputTargets, setShowOutputTargets] = useState(false);
+  const [expandedOutputTarget, setExpandedOutputTarget] = useState(null);
 
   // Fetch devices on mount
   useEffect(() => {
@@ -61,6 +73,7 @@ function App() {
     fetchPresets();
     fetchRoutingMatrix();
     fetchNoiseGate();
+    fetchOutputTargets();
     
     const statusInterval = setInterval(fetchStatus, 1000);
     
@@ -86,6 +99,7 @@ function App() {
       const timer = setTimeout(() => {
         fetchRoutingMatrix();
         fetchNoiseGate();
+        fetchOutputTargets();
       }, 100);
       return () => clearTimeout(timer);
     }
@@ -180,6 +194,16 @@ function App() {
       if (data.default_noise_gate) {
         setDefaultNoiseGate(data.default_noise_gate);
       }
+      if (data.output_level_targets) {
+        const targets = {};
+        for (const [key, value] of Object.entries(data.output_level_targets)) {
+          targets[parseInt(key)] = value;
+        }
+        setOutputLevelTargets(targets);
+      }
+      if (data.default_output_target) {
+        setDefaultOutputTarget(data.default_output_target);
+      }
     } catch (err) {
       console.error('Failed to fetch config:', err);
     }
@@ -272,6 +296,25 @@ function App() {
     }
   };
   
+  const fetchOutputTargets = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/output-level-targets`);
+      const data = await res.json();
+      if (data.output_level_targets) {
+        const targets = {};
+        for (const [key, value] of Object.entries(data.output_level_targets)) {
+          targets[parseInt(key)] = value;
+        }
+        setOutputLevelTargets(targets);
+      }
+      if (data.default_output_target) {
+        setDefaultOutputTarget(data.default_output_target);
+      }
+    } catch (err) {
+      console.error('Failed to fetch output targets:', err);
+    }
+  };
+  
   const updateNoiseGateParam = async (channel, paramName, value) => {
     try {
       // Update local state first for immediate UI feedback
@@ -312,6 +355,78 @@ function App() {
     } catch (err) {
       console.error('Failed to update default noise gate:', err);
       fetchNoiseGate();
+    }
+  };
+  
+  const getOutputTarget = (channel) => {
+    return {
+      ...defaultOutputTarget,
+      ...(outputLevelTargets[channel] || {})
+    };
+  };
+  
+  const updateOutputTargetParam = async (channel, paramName, value) => {
+    try {
+      const current = getOutputTarget(channel);
+      let nextValue = value;
+      if (paramName === 'enabled') {
+        nextValue = Boolean(value);
+      } else {
+        nextValue = parseFloat(value);
+        if (paramName === 'min_db') {
+          nextValue = Math.min(nextValue, current.max_db);
+        } else if (paramName === 'max_db') {
+          nextValue = Math.max(nextValue, current.min_db);
+        } else if (paramName === 'max_boost_db' || paramName === 'max_cut_db') {
+          nextValue = Math.max(0, nextValue);
+        }
+      }
+      const updated = { ...current, [paramName]: nextValue };
+      setOutputLevelTargets((prev) => ({
+        ...prev,
+        [channel]: updated
+      }));
+      await fetch(`${API_BASE}/output-level-targets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          channel,
+          params: updated
+        })
+      });
+    } catch (err) {
+      console.error('Failed to update output target:', err);
+      fetchOutputTargets();
+    }
+  };
+  
+  const updateDefaultOutputTargetParam = async (paramName, value) => {
+    try {
+      let nextValue = value;
+      if (paramName === 'enabled') {
+        nextValue = Boolean(value);
+      } else {
+        nextValue = parseFloat(value);
+        if (paramName === 'min_db') {
+          nextValue = Math.min(nextValue, defaultOutputTarget.max_db);
+        } else if (paramName === 'max_db') {
+          nextValue = Math.max(nextValue, defaultOutputTarget.min_db);
+        } else if (paramName === 'max_boost_db' || paramName === 'max_cut_db') {
+          nextValue = Math.max(0, nextValue);
+        }
+      }
+      const updated = { ...defaultOutputTarget, [paramName]: nextValue };
+      setDefaultOutputTarget(updated);
+      await fetch(`${API_BASE}/output-level-targets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          default_output_target: updated
+        })
+      });
+    } catch (err) {
+      console.error('Failed to update default output target:', err);
+      fetchOutputTargets();
     }
   };
   
@@ -454,6 +569,15 @@ function App() {
   const getLevelWidth = (db) => {
     const normalized = Math.max(0, Math.min(100, (db + 60) / 60 * 100));
     return `${normalized}%`;
+  };
+  
+  const formatDbValue = (value, decimals = 1) => {
+    if (value === undefined || value === null || Number.isNaN(value)) {
+      return '---';
+    }
+    const fixed = Number(value).toFixed(decimals);
+    const prefix = Number(value) > 0 ? '+' : '';
+    return `${prefix}${fixed} dB`;
   };
 
   const formatDuration = (seconds) => {
@@ -895,6 +1019,230 @@ function App() {
           )}
         </div>
 
+        {/* Output Level Targets */}
+        <div className="bg-slate-800 rounded-xl p-6 mb-6 border border-slate-700">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h2 className="text-xl font-semibold">Output Level Targets</h2>
+              <p className="text-xs text-slate-400 mt-1">
+                Keep each output bus within a safe dB window by applying automatic gain after routing and mixing.
+              </p>
+            </div>
+            <button
+              onClick={() => setShowOutputTargets(!showOutputTargets)}
+              className="px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm transition"
+            >
+              {showOutputTargets ? 'Hide' : 'Show'} Targets
+            </button>
+          </div>
+          
+          {showOutputTargets && (
+            <>
+              <div className="grid gap-4 md:grid-cols-2">
+                {Array.from({ length: outputChannels }, (_, outputIdx) => {
+                  const target = getOutputTarget(outputIdx);
+                  return (
+                    <div key={outputIdx} className="bg-slate-900/40 border border-slate-700 rounded-lg p-4 space-y-3">
+                      <div className="flex items-start justify-between">
+                        <div>
+                          <h3 className="text-sm font-semibold text-slate-200">Output {outputIdx + 1}</h3>
+                          <p className="text-xs text-slate-400">
+                            Target {formatDbValue(target.min_db)} → {formatDbValue(target.max_db)}
+                          </p>
+                        </div>
+                        <label className="flex items-center gap-2 text-xs text-slate-300">
+                          <input
+                            type="checkbox"
+                            checked={target.enabled}
+                            onChange={(e) => updateOutputTargetParam(outputIdx, 'enabled', e.target.checked)}
+                            className="w-4 h-4 rounded"
+                          />
+                          Enable
+                        </label>
+                      </div>
+                      
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-3">
+                          <label className="text-xs text-slate-400 w-24">Min Level:</label>
+                          <input
+                            type="range"
+                            min="-60"
+                            max="0"
+                            step="0.5"
+                            value={target.min_db}
+                            onChange={(e) => updateOutputTargetParam(outputIdx, 'min_db', parseFloat(e.target.value))}
+                            className="flex-1"
+                            disabled={!target.enabled}
+                          />
+                          <div className="w-20 text-xs font-mono text-right text-slate-300">
+                            {formatDbValue(target.min_db)}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <label className="text-xs text-slate-400 w-24">Max Level:</label>
+                          <input
+                            type="range"
+                            min="-30"
+                            max="6"
+                            step="0.5"
+                            value={target.max_db}
+                            onChange={(e) => updateOutputTargetParam(outputIdx, 'max_db', parseFloat(e.target.value))}
+                            className="flex-1"
+                            disabled={!target.enabled}
+                          />
+                          <div className="w-20 text-xs font-mono text-right text-slate-300">
+                            {formatDbValue(target.max_db)}
+                          </div>
+                        </div>
+                      </div>
+                      
+                      <div className="flex items-center justify-between text-xs text-slate-400 pt-2 border-t border-slate-700/70">
+                        <button
+                          onClick={() =>
+                            setExpandedOutputTarget(expandedOutputTarget === outputIdx ? null : outputIdx)
+                          }
+                          className="text-slate-300 hover:text-white transition"
+                        >
+                          {expandedOutputTarget === outputIdx ? '▼' : '▶'} Advanced
+                        </button>
+                        <span>
+                          Boost {formatDbValue(target.max_boost_db, 1)} / Cut {formatDbValue(-target.max_cut_db, 1)}
+                        </span>
+                      </div>
+                      
+                      {expandedOutputTarget === outputIdx && (
+                        <div className="space-y-2 pt-2 text-xs text-slate-400">
+                          <div className="flex items-center gap-3">
+                            <label className="w-32">Max Boost:</label>
+                            <input
+                              type="range"
+                              min="0"
+                              max="36"
+                              step="0.5"
+                              value={target.max_boost_db}
+                              onChange={(e) =>
+                                updateOutputTargetParam(outputIdx, 'max_boost_db', parseFloat(e.target.value))
+                              }
+                              className="flex-1"
+                              disabled={!target.enabled}
+                            />
+                            <div className="w-16 text-right font-mono text-slate-300">
+                              {formatDbValue(target.max_boost_db)}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <label className="w-32">Max Cut:</label>
+                            <input
+                              type="range"
+                              min="0"
+                              max="36"
+                              step="0.5"
+                              value={target.max_cut_db}
+                              onChange={(e) =>
+                                updateOutputTargetParam(outputIdx, 'max_cut_db', parseFloat(e.target.value))
+                              }
+                              className="flex-1"
+                              disabled={!target.enabled}
+                            />
+                            <div className="w-16 text-right font-mono text-slate-300">
+                              {formatDbValue(-target.max_cut_db)}
+                            </div>
+                          </div>
+                          <p className="text-[11px] text-slate-500">
+                            Boost and cut limits cap how aggressively the router lifts or lowers the signal to stay within the target window.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              
+              <div className="mt-6 pt-6 border-t border-slate-700">
+                <h3 className="text-sm font-semibold mb-3 text-slate-300">Default Target Template</h3>
+                <div className="space-y-2">
+                  <label className="flex items-center gap-2 text-xs text-slate-300">
+                    <input
+                      type="checkbox"
+                      checked={defaultOutputTarget.enabled}
+                      onChange={(e) => updateDefaultOutputTargetParam('enabled', e.target.checked)}
+                      className="w-4 h-4 rounded"
+                    />
+                    Enable targeting for new outputs by default
+                  </label>
+                  <div className="flex items-center gap-3">
+                    <label className="text-xs text-slate-400 w-24">Min Level:</label>
+                    <input
+                      type="range"
+                      min="-60"
+                      max="0"
+                      step="0.5"
+                      value={defaultOutputTarget.min_db}
+                      onChange={(e) => updateDefaultOutputTargetParam('min_db', parseFloat(e.target.value))}
+                      className="flex-1"
+                    />
+                    <div className="w-20 text-xs font-mono text-right text-slate-300">
+                      {formatDbValue(defaultOutputTarget.min_db)}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <label className="text-xs text-slate-400 w-24">Max Level:</label>
+                    <input
+                      type="range"
+                      min="-30"
+                      max="6"
+                      step="0.5"
+                      value={defaultOutputTarget.max_db}
+                      onChange={(e) => updateDefaultOutputTargetParam('max_db', parseFloat(e.target.value))}
+                      className="flex-1"
+                    />
+                    <div className="w-20 text-xs font-mono text-right text-slate-300">
+                      {formatDbValue(defaultOutputTarget.max_db)}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <label className="text-xs text-slate-400 w-24">Max Boost:</label>
+                    <input
+                      type="range"
+                      min="0"
+                      max="36"
+                      step="0.5"
+                      value={defaultOutputTarget.max_boost_db}
+                      onChange={(e) =>
+                        updateDefaultOutputTargetParam('max_boost_db', parseFloat(e.target.value))
+                      }
+                      className="flex-1"
+                    />
+                    <div className="w-20 text-xs font-mono text-right text-slate-300">
+                      {formatDbValue(defaultOutputTarget.max_boost_db)}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <label className="text-xs text-slate-400 w-24">Max Cut:</label>
+                    <input
+                      type="range"
+                      min="0"
+                      max="36"
+                      step="0.5"
+                      value={defaultOutputTarget.max_cut_db}
+                      onChange={(e) =>
+                        updateDefaultOutputTargetParam('max_cut_db', parseFloat(e.target.value))
+                      }
+                      className="flex-1"
+                    />
+                    <div className="w-20 text-xs font-mono text-right text-slate-300">
+                      {formatDbValue(-defaultOutputTarget.max_cut_db)}
+                    </div>
+                  </div>
+                </div>
+                <p className="mt-3 text-xs text-slate-500">
+                  Defaults apply whenever a new output channel is detected. Each output can then override these values individually.
+                </p>
+              </div>
+            </>
+          )}
+        </div>
+        
         {/* Configuration Panel */}
         {showConfig && (
           <div className="bg-slate-800 rounded-xl p-6 mb-6 border border-slate-700">

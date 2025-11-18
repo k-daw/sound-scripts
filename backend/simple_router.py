@@ -39,6 +39,7 @@ class SimpleAudioRouter:
         self.routing_matrix = {}
         self.use_routing_matrix = False
         self._routing_matrix_lock = threading.Lock()
+        self._output_target_lock = threading.Lock()
         
         # Noise gate: per-channel parameters
         # Structure: channel_index -> {threshold, attack, release, hold, range}
@@ -53,6 +54,17 @@ class SimpleAudioRouter:
         
         # Gate state tracking per channel
         self.gate_state = {}  # channel_index -> {is_open, open_time, close_time, current_gain}
+        
+        # Output level targeting (per output channel)
+        self._output_target_template = {
+            'enabled': False,
+            'min_db': -18.0,
+            'max_db': -6.0,
+            'max_boost_db': 24.0,
+            'max_cut_db': 24.0
+        }
+        self.default_output_target = copy.deepcopy(self._output_target_template)
+        self.output_level_targets = {}  # output_channel -> dict of parameters
         
         # Recording
         self.recording = False
@@ -76,6 +88,66 @@ class SimpleAudioRouter:
                 db = float(20 * np.log10(peak))  # Convert to Python float for JSON serialization
             levels.append(db)
         return levels
+    
+    def _normalize_output_target(self, target, base=None):
+        """Validate and normalize an output target configuration"""
+        if base is None:
+            base = self.default_output_target
+        normalized = copy.deepcopy(base)
+        if target is None:
+            target = {}
+        for key in self._output_target_template.keys():
+            if key in target:
+                if key == 'enabled':
+                    normalized[key] = bool(target[key])
+                else:
+                    try:
+                        normalized[key] = float(target[key])
+                    except (TypeError, ValueError):
+                        continue
+        # Ensure sensible values
+        normalized['min_db'] = float(normalized['min_db'])
+        normalized['max_db'] = float(normalized['max_db'])
+        if normalized['min_db'] > normalized['max_db']:
+            normalized['min_db'], normalized['max_db'] = normalized['max_db'], normalized['min_db']
+        normalized['max_boost_db'] = max(0.0, float(normalized['max_boost_db']))
+        normalized['max_cut_db'] = max(0.0, float(normalized['max_cut_db']))
+        normalized['enabled'] = bool(normalized['enabled'])
+        return normalized
+    
+    def apply_output_level_targets(self, outdata, targets):
+        """Apply per-output dynamic gain to keep channels within desired range"""
+        if not targets:
+            return outdata
+        channel_count = min(self.output_channels, outdata.shape[1])
+        for output_ch in range(channel_count):
+            target = targets.get(output_ch)
+            if not target or not target.get('enabled', False):
+                continue
+            min_db = float(target.get('min_db', self.default_output_target['min_db']))
+            max_db = float(target.get('max_db', self.default_output_target['max_db']))
+            if min_db > max_db:
+                min_db, max_db = max_db, min_db
+            max_boost = float(target.get('max_boost_db', self.default_output_target['max_boost_db']))
+            max_cut = float(target.get('max_cut_db', self.default_output_target['max_cut_db']))
+            
+            channel_data = outdata[:, output_ch]
+            peak = float(np.max(np.abs(channel_data)))
+            if peak < 1e-7:
+                continue
+            current_db = 20.0 * np.log10(peak)
+            gain_db = 0.0
+            if current_db < min_db:
+                gain_db = min(min_db - current_db, max_boost)
+            elif current_db > max_db:
+                gain_db = max(max_db - current_db, -max_cut)
+            else:
+                continue
+            if abs(gain_db) < 0.1:
+                continue
+            gain = self.db_to_linear(gain_db)
+            outdata[:, output_ch] = np.clip(channel_data * gain, -1.0, 1.0)
+        return outdata
     
     def process_audio(self):
         """Main audio processing loop"""
@@ -128,6 +200,8 @@ class SimpleAudioRouter:
                         routing_matrix_copy = copy.deepcopy(self.routing_matrix)
                     else:
                         routing_matrix_copy = None
+                with self._output_target_lock:
+                    output_targets_copy = copy.deepcopy(self.output_level_targets)
                 
                 # Apply output gain
                 output_gain = self.db_to_linear(self.output_gain_db)
@@ -241,6 +315,7 @@ class SimpleAudioRouter:
                         outdata[:, ch] = mixed
                 
                 # Final clip
+                outdata = self.apply_output_level_targets(outdata, output_targets_copy)
                 outdata = np.clip(outdata, -1.0, 1.0)
                 
                 # Record if enabled
@@ -313,6 +388,16 @@ class SimpleAudioRouter:
                         'current_gain': 0.0  # linear gain (0.0 to 1.0)
                     }
             
+            # Initialize output level targets for current outputs
+            with self._output_target_lock:
+                new_output_targets = {}
+                for ch in range(self.output_channels):
+                    if ch in self.output_level_targets:
+                        new_output_targets[ch] = self._normalize_output_target(self.output_level_targets[ch])
+                    else:
+                        new_output_targets[ch] = copy.deepcopy(self.default_output_target)
+                self.output_level_targets = new_output_targets
+            
             self.input_device = input_device
             self.output_device = output_device
             self.running = True
@@ -348,6 +433,8 @@ class SimpleAudioRouter:
             'output_channels': self.output_channels,
             'noise_gate_params': {str(k): copy.deepcopy(v) for k, v in self.noise_gate_params.items()},
             'default_noise_gate': copy.deepcopy(self.default_noise_gate),
+            'output_level_targets': {str(k): copy.deepcopy(v) for k, v in self.output_level_targets.items()},
+            'default_output_target': copy.deepcopy(self.default_output_target),
             # Frontend expects these but we don't use them in simple router
             'threshold_db': -40,
             'priority_channels': [1, 3],
@@ -387,6 +474,18 @@ class SimpleAudioRouter:
             for key, value in config['default_noise_gate'].items():
                 if key in self.default_noise_gate:
                     self.default_noise_gate[key] = float(value)
+        if 'default_output_target' in config:
+            self.default_output_target = self._normalize_output_target(
+                config['default_output_target'],
+                base=self._output_target_template
+            )
+        if 'output_level_targets' in config:
+            targets = config['output_level_targets']
+            if isinstance(targets, dict):
+                with self._output_target_lock:
+                    for channel, params in targets.items():
+                        channel = int(channel)
+                        self.output_level_targets[channel] = self._normalize_output_target(params)
     
     def start_recording(self, filename=None):
         """Start recording to WAV file"""
@@ -658,6 +757,43 @@ def update_noise_gate():
                 for key, value in params.items():
                     if key in router.noise_gate_params[channel]:
                         router.noise_gate_params[channel][key] = float(value)
+        return jsonify({'status': 'updated'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/output-level-targets', methods=['GET'])
+def get_output_level_targets():
+    """Get per-output level target configurations"""
+    try:
+        with router._output_target_lock:
+            targets = {str(k): copy.deepcopy(v) for k, v in router.output_level_targets.items()}
+            default_target = copy.deepcopy(router.default_output_target)
+        return jsonify({
+            'output_level_targets': targets,
+            'default_output_target': default_target,
+            'output_channels': router.output_channels
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/output-level-targets', methods=['POST'])
+def update_output_level_targets():
+    """Update per-output level targeting parameters"""
+    try:
+        data = request.json or {}
+        with router._output_target_lock:
+            if 'default_output_target' in data:
+                router.default_output_target = router._normalize_output_target(
+                    data['default_output_target'],
+                    base=router._output_target_template
+                )
+            if 'targets' in data and isinstance(data['targets'], dict):
+                for channel, params in data['targets'].items():
+                    channel = int(channel)
+                    router.output_level_targets[channel] = router._normalize_output_target(params)
+            if 'channel' in data and 'params' in data:
+                channel = int(data['channel'])
+                router.output_level_targets[channel] = router._normalize_output_target(data['params'])
         return jsonify({'status': 'updated'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
