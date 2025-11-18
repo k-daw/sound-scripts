@@ -70,14 +70,26 @@ function App() {
   // Fetch routing matrix when devices change
   useEffect(() => {
     if (inputDevice !== null && outputDevice !== null) {
+      // Update input channels from selected device
+      const selectedInputDevice = devices.find(d => d.index === inputDevice);
+      const selectedOutputDevice = devices.find(d => d.index === outputDevice);
+      
+      if (selectedInputDevice) {
+        setInputChannels(selectedInputDevice.input_channels);
+      }
+      if (selectedOutputDevice) {
+        setOutputChannels(selectedOutputDevice.output_channels);
+      }
+      
       // Small delay to let backend update channel counts
+      // Note: fetchRoutingMatrix will only update channels if router is running
       const timer = setTimeout(() => {
         fetchRoutingMatrix();
         fetchNoiseGate();
       }, 100);
       return () => clearTimeout(timer);
     }
-  }, [inputDevice, outputDevice]);
+  }, [inputDevice, outputDevice, devices]);
 
   // Listen for real-time level updates
   useEffect(() => {
@@ -138,11 +150,25 @@ function App() {
       if (data.routing_matrix) {
         setRoutingMatrix(data.routing_matrix);
       }
-      if (data.input_channels) {
-        setInputChannels(data.input_channels);
-      }
-      if (data.output_channels) {
-        setOutputChannels(data.output_channels);
+      // Only update channel counts from backend if router is running
+      // Otherwise, use device info which is more reliable
+      if (running) {
+        if (data.input_channels) {
+          setInputChannels(data.input_channels);
+        }
+        if (data.output_channels) {
+          setOutputChannels(data.output_channels);
+        }
+      } else {
+        // If router not running, update from device info if available
+        const selectedInputDevice = devices.find(d => d.index === data.input_device);
+        const selectedOutputDevice = devices.find(d => d.index === data.output_device);
+        if (selectedInputDevice) {
+          setInputChannels(selectedInputDevice.input_channels);
+        }
+        if (selectedOutputDevice) {
+          setOutputChannels(selectedOutputDevice.output_channels);
+        }
       }
       if (data.noise_gate_params) {
         const params = {};
@@ -169,11 +195,15 @@ function App() {
       if (data.routing_matrix) {
         setRoutingMatrix(data.routing_matrix);
       }
-      if (data.input_channels) {
-        setInputChannels(data.input_channels);
-      }
-      if (data.output_channels) {
-        setOutputChannels(data.output_channels);
+      // Only update channel counts from backend if router is running
+      // Otherwise, use device info which is more reliable
+      if (running) {
+        if (data.input_channels) {
+          setInputChannels(data.input_channels);
+        }
+        if (data.output_channels) {
+          setOutputChannels(data.output_channels);
+        }
       }
     } catch (err) {
       console.error('Failed to fetch routing matrix:', err);
